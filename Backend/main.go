@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
-	"math/rand"
+	"math"
 	"net/http"
 	"time"
 
@@ -14,31 +14,22 @@ import (
 	"github.com/rs/cors"
 )
 
-type Account struct {
-	AccountNo string `json:"account_no"`
-	Currency  string `json:"account_ccy"`
-	Country   string `json:"account_country"`
-}
-
-type TreeMapData struct {
-	Key  string `json:"key"`
-	Data []struct {
-		Key  string `json:"key"`
-		Data int    `json:"data"`
-	} `json:"data"`
+type AccountBalance struct {
+	AccountNo        string  `json:"account_no"`
+	OpeningBalance   float64 `json:"opening_balance"`
+	ClosingBalance   float64 `json:"closing_balance"`
+	PercentageChange float64 `json:"percentage_change"`
+	Currency         string  `json:"currency"`
+	Country          string  `json:"country"`
 }
 
 type FilterRequest struct {
-	Filter string `json:"filter"` // Either 'account_ccy' or 'account_country'
+	GroupBy string `json:"groupby"` // Either 'opening_balance_currency' or 'country_id'
 }
 
 func main() {
 	log.Println("Starting server initialization...")
 
-	// Initialize random seed
-	rand.Seed(time.Now().UnixNano())
-
-	// Database connection string - update with your credentials
 	connStr := "host=localhost port=9003 user=postgres password=arthavedh123 dbname=statement_processing sslmode=disable"
 
 	log.Println("Connecting to database...")
@@ -48,12 +39,10 @@ func main() {
 	}
 	defer db.Close()
 
-	// Set connection pool settings
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Test connection with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -63,97 +52,93 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// API endpoint to fetch TreeMap data with POST request
 	r.HandleFunc("/heatmap/filterdata", func(w http.ResponseWriter, r *http.Request) {
 		var req FilterRequest
-		// Parse the JSON body to get the filter type (account_ccy or account_country)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
 			return
 		}
 
-		// Validate the filter value
-		if req.Filter != "account_ccy" && req.Filter != "account_country" {
-			http.Error(w, "Invalid filter value. It must be either 'account_ccy' or 'account_country'", http.StatusBadRequest)
+		if req.GroupBy != "opening_balance_currency" && req.GroupBy != "country_id" {
+			http.Error(w, "Invalid groupby value. It must be either 'opening_balance_currency' or 'country_id'", http.StatusBadRequest)
 			return
 		}
 
-		// Build the query based on the selected filter
-		var query string
-		var rows *sql.Rows
-		if req.Filter == "account_ccy" {
-			// For account_ccy, group by account_ccy
-			query = `SELECT account_ccy, account_no FROM accounts GROUP BY account_ccy, account_no`
-			rows, err = db.Query(query)
-		} else if req.Filter == "account_country" {
-			// For account_country, group by account_country
-			query = `SELECT account_country, account_no FROM accounts GROUP BY account_country, account_no`
-			rows, err = db.Query(query)
+		groupByColumn := ""
+		if req.GroupBy == "opening_balance_currency" {
+			groupByColumn = "opening_balance_currency"
+		} else if req.GroupBy == "country_id" {
+			groupByColumn = "country_id"
 		}
 
+		query := `
+			WITH latest_records AS (
+				SELECT DISTINCT ON (account_no) *
+				FROM account_balance
+				ORDER BY account_no, account_balance_date DESC
+			)
+			SELECT ` + groupByColumn + `, account_no,
+				opening_balance_amount,
+				opening_balance_cdtdbtind,
+				closing_balance_amount,
+				closing_balance_cdtdbtind
+			FROM latest_records
+			GROUP BY ` + groupByColumn + `, account_no,
+				opening_balance_amount,
+				opening_balance_cdtdbtind,
+				closing_balance_amount,
+				closing_balance_cdtdbtind`
+
+		rows, err := db.Query(query)
 		if err != nil {
 			http.Error(w, "Database query failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
 
-		// Prepare the data structure to hold grouped data
-		dataMap := make(map[string][]string)
+		var result []AccountBalance
 		for rows.Next() {
-			var acc Account
-			if req.Filter == "account_ccy" {
-				if err := rows.Scan(&acc.Currency, &acc.AccountNo); err != nil {
-					http.Error(w, "Row scan failed: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-				dataMap[acc.Currency] = append(dataMap[acc.Currency], acc.AccountNo)
-			} else if req.Filter == "account_country" {
-				if err := rows.Scan(&acc.Country, &acc.AccountNo); err != nil {
-					http.Error(w, "Row scan failed: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-				dataMap[acc.Country] = append(dataMap[acc.Country], acc.AccountNo)
+			var acc AccountBalance
+			var openingBalanceIndicator, closingBalanceIndicator string
+			var openingBalanceAmount, closingBalanceAmount float64
+
+			if err := rows.Scan(&acc.Currency, &acc.AccountNo, &openingBalanceAmount, &openingBalanceIndicator, &closingBalanceAmount, &closingBalanceIndicator); err != nil {
+				http.Error(w, "Row scan failed: "+err.Error(), http.StatusInternalServerError)
+				return
 			}
+
+			if openingBalanceIndicator == "DBIT" {
+				openingBalanceAmount = -math.Abs(openingBalanceAmount)
+			}
+			if closingBalanceIndicator == "DBIT" {
+				closingBalanceAmount = -math.Abs(closingBalanceAmount)
+			}
+
+			acc.OpeningBalance = openingBalanceAmount
+			acc.ClosingBalance = closingBalanceAmount
+
+			if closingBalanceAmount != 0 {
+				acc.PercentageChange = ((closingBalanceAmount - openingBalanceAmount) / math.Abs(closingBalanceAmount)) * 100
+			}
+
+			result = append(result, acc)
 		}
 
-		// Prepare the final result structure
-		var result []TreeMapData
-		for key, accounts := range dataMap {
-			var accountData []struct {
-				Key  string `json:"key"`
-				Data int    `json:"data"`
-			}
-
-			// Random value between 10-60 for each account
-			for _, accNo := range accounts {
-				accountData = append(accountData, struct {
-					Key  string `json:"key"`
-					Data int    `json:"data"`
-				}{
-					Key:  accNo,
-					Data: rand.Intn(50) + 10, // Random value between 10-60
-				})
-			}
-
-			// Add the grouped data to the final result
-			result = append(result, TreeMapData{
-				Key:  key,
-				Data: accountData,
-			})
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Error iterating rows: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 
-		// Send the response as JSON
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(w).Encode(result)
 	}).Methods("POST")
 
-	// CORS middleware to allow all origins
 	c := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"POST", "OPTIONS"},
 		AllowedHeaders: []string{"Content-Type"},
-		MaxAge:         86400, // 24 hours for preflight cache
+		MaxAge:         86400,
 	})
 
 	srv := &http.Server{
