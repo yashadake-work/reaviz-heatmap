@@ -64,7 +64,7 @@ func main() {
 	r := mux.NewRouter()
 
 	// API endpoint to fetch TreeMap data with POST request
-	r.HandleFunc("/api/filterdata", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/heatmap/filterdata", func(w http.ResponseWriter, r *http.Request) {
 		var req FilterRequest
 		// Parse the JSON body to get the filter type (account_ccy or account_country)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

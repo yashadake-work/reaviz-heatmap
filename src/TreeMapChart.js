@@ -20,7 +20,7 @@ const TreeMapChart = () => {
     }
 
     try {
-      const response = await fetch('http://localhost:8080/api/filterdata', {
+      const response = await fetch('http://localhost:8080/heatmap/filterdata', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
