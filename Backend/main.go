@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"time"
 
@@ -20,14 +23,24 @@ type TreeMapData struct {
 	} `json:"data"`
 }
 
-type GroupByRequest struct {
-	GroupBy string `json:"groupby"` // "opening_balance_currency" or "country_id"
+type FilterRequest struct {
+	GroupBy string `json:"groupby"`
+}
+
+func maskAccountNo(accountNo string) string {
+	if len(accountNo) < 6 {
+		return accountNo
+	}
+	return fmt.Sprintf("%s***%s", accountNo[:4], accountNo[len(accountNo)-2:])
+}
+
+func roundToThreeDecimals(value float64) float64 {
+	return math.Round(value*1000) / 1000
 }
 
 func main() {
 	log.Println("Starting server initialization...")
 
-	// Database connection string - update with your credentials
 	connStr := "host=localhost port=9003 user=postgres password=arthavedh123 dbname=statement_processing sslmode=disable"
 
 	log.Println("Connecting to database...")
@@ -37,28 +50,41 @@ func main() {
 	}
 	defer db.Close()
 
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		log.Fatal("Database ping failed:", err)
+	}
+	log.Println("Database connected successfully")
+
 	r := mux.NewRouter()
 
-	// API endpoint to fetch grouped data
 	r.HandleFunc("/heatmap/filterdata", func(w http.ResponseWriter, r *http.Request) {
-		var req GroupByRequest
+		var req FilterRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
 			return
 		}
 
 		if req.GroupBy != "opening_balance_currency" && req.GroupBy != "country_id" {
-			http.Error(w, "Invalid groupby value. It must be either 'opening_balance_currency' or 'country_id'", http.StatusBadRequest)
+			http.Error(w, "Invalid groupby value. Must be 'opening_balance_currency' or 'country_id'", http.StatusBadRequest)
 			return
 		}
 
 		query := `
-			SELECT DISTINCT ON (account_no) 
-				account_no, opening_balance_currency, country_id, 
-				opening_balance_amount, opening_balance_cdtdbtind, 
+			WITH latest_records AS (
+				SELECT DISTINCT ON (account_no) *
+				FROM account_balance
+				ORDER BY account_no, account_balance_date DESC
+			)
+			SELECT ` + req.GroupBy + `, account_no, 
+				opening_balance_amount, opening_balance_cdtdbtind,
 				closing_balance_amount, closing_balance_cdtdbtind
-			FROM account_balance
-			ORDER BY account_no, account_balance_date DESC
+			FROM latest_records
 		`
 
 		rows, err := db.Query(query)
@@ -68,75 +94,53 @@ func main() {
 		}
 		defer rows.Close()
 
-		dataMap := make(map[string]map[string]float64) // groupby_value -> account_no -> percentage_change
+		dataMap := make(map[string][]struct {
+			Key  string  `json:"key"`
+			Data float64 `json:"data"`
+		})
 
 		for rows.Next() {
-			var (
-				accountNo              string
-				openingBalanceCurrency string
-				countryID              string
-				openingBalanceAmount   float64
-				openingCdtDbtInd       string
-				closingBalanceAmount   float64
-				closingCdtDbtInd       string
-			)
+			var groupKey, accountNo, openingIndicator, closingIndicator string
+			var openingBalance, closingBalance float64
 
-			if err := rows.Scan(&accountNo, &openingBalanceCurrency, &countryID, &openingBalanceAmount, &openingCdtDbtInd, &closingBalanceAmount, &closingCdtDbtInd); err != nil {
+			if err := rows.Scan(&groupKey, &accountNo, &openingBalance, &openingIndicator, &closingBalance, &closingIndicator); err != nil {
 				http.Error(w, "Row scan failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			// Adjust balance amounts based on credit or debit indicators
-			if openingCdtDbtInd == "DBIT" {
-				openingBalanceAmount = -openingBalanceAmount
+			if openingIndicator == "DBIT" {
+				openingBalance = -openingBalance
 			}
-			if closingCdtDbtInd == "DBIT" {
-				closingBalanceAmount = -closingBalanceAmount
-			}
-
-			// Calculate percentage change
-			percentChange := ((closingBalanceAmount - openingBalanceAmount) / closingBalanceAmount) * 100
-
-			// Group by the specified key
-			groupByKey := ""
-			if req.GroupBy == "opening_balance_currency" {
-				groupByKey = openingBalanceCurrency
-			} else {
-				groupByKey = countryID
+			if closingIndicator == "DBIT" {
+				closingBalance = -closingBalance
 			}
 
-			if _, exists := dataMap[groupByKey]; !exists {
-				dataMap[groupByKey] = make(map[string]float64)
+			percentChange := 0.0
+			if closingBalance != 0 {
+				percentChange = ((closingBalance - openingBalance) / closingBalance) * 100
 			}
-			dataMap[groupByKey][accountNo] = percentChange
-		}
+			percentChange = roundToThreeDecimals(percentChange)
 
-		// Prepare the final result
-		var result []TreeMapData
-		for key, accounts := range dataMap {
-			var accountData []struct {
+			maskedAccountNo := maskAccountNo(accountNo)
+			dataMap[groupKey] = append(dataMap[groupKey], struct {
 				Key  string  `json:"key"`
 				Data float64 `json:"data"`
-			}
-
-			for accNo, percentChange := range accounts {
-				accountData = append(accountData, struct {
-					Key  string  `json:"key"`
-					Data float64 `json:"data"`
-				}{
-					Key:  accNo,
-					Data: percentChange,
-				})
-			}
-
-			result = append(result, TreeMapData{
-				Key:  key,
-				Data: accountData,
+			}{
+				Key:  maskedAccountNo,
+				Data: percentChange,
 			})
 		}
 
-		// Send the response
+		var result []TreeMapData
+		for key, accounts := range dataMap {
+			result = append(result, TreeMapData{
+				Key:  key,
+				Data: accounts,
+			})
+		}
+
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(w).Encode(result)
 	}).Methods("POST")
 
