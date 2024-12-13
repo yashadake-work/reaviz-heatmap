@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
-	"math"
 	"net/http"
 	"time"
 
@@ -14,22 +12,22 @@ import (
 	"github.com/rs/cors"
 )
 
-type AccountBalance struct {
-	AccountNo        string  `json:"account_no"`
-	OpeningBalance   float64 `json:"opening_balance"`
-	ClosingBalance   float64 `json:"closing_balance"`
-	PercentageChange float64 `json:"percentage_change"`
-	Currency         string  `json:"currency"`
-	Country          string  `json:"country"`
+type TreeMapData struct {
+	Key  string `json:"key"`
+	Data []struct {
+		Key  string  `json:"key"`
+		Data float64 `json:"data"`
+	} `json:"data"`
 }
 
-type FilterRequest struct {
-	GroupBy string `json:"groupby"` // Either 'opening_balance_currency' or 'country_id'
+type GroupByRequest struct {
+	GroupBy string `json:"groupby"` // "opening_balance_currency" or "country_id"
 }
 
 func main() {
 	log.Println("Starting server initialization...")
 
+	// Database connection string - update with your credentials
 	connStr := "host=localhost port=9003 user=postgres password=arthavedh123 dbname=statement_processing sslmode=disable"
 
 	log.Println("Connecting to database...")
@@ -39,21 +37,11 @@ func main() {
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		log.Fatal("Database ping failed:", err)
-	}
-	log.Println("Database connected successfully")
-
 	r := mux.NewRouter()
 
+	// API endpoint to fetch grouped data
 	r.HandleFunc("/heatmap/filterdata", func(w http.ResponseWriter, r *http.Request) {
-		var req FilterRequest
+		var req GroupByRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON request", http.StatusBadRequest)
 			return
@@ -64,30 +52,14 @@ func main() {
 			return
 		}
 
-		groupByColumn := ""
-		if req.GroupBy == "opening_balance_currency" {
-			groupByColumn = "opening_balance_currency"
-		} else if req.GroupBy == "country_id" {
-			groupByColumn = "country_id"
-		}
-
 		query := `
-			WITH latest_records AS (
-				SELECT DISTINCT ON (account_no) *
-				FROM account_balance
-				ORDER BY account_no, account_balance_date DESC
-			)
-			SELECT ` + groupByColumn + `, account_no,
-				opening_balance_amount,
-				opening_balance_cdtdbtind,
-				closing_balance_amount,
-				closing_balance_cdtdbtind
-			FROM latest_records
-			GROUP BY ` + groupByColumn + `, account_no,
-				opening_balance_amount,
-				opening_balance_cdtdbtind,
-				closing_balance_amount,
-				closing_balance_cdtdbtind`
+			SELECT DISTINCT ON (account_no) 
+				account_no, opening_balance_currency, country_id, 
+				opening_balance_amount, opening_balance_cdtdbtind, 
+				closing_balance_amount, closing_balance_cdtdbtind
+			FROM account_balance
+			ORDER BY account_no, account_balance_date DESC
+		`
 
 		rows, err := db.Query(query)
 		if err != nil {
@@ -96,41 +68,75 @@ func main() {
 		}
 		defer rows.Close()
 
-		var result []AccountBalance
-		for rows.Next() {
-			var acc AccountBalance
-			var openingBalanceIndicator, closingBalanceIndicator string
-			var openingBalanceAmount, closingBalanceAmount float64
+		dataMap := make(map[string]map[string]float64) // groupby_value -> account_no -> percentage_change
 
-			if err := rows.Scan(&acc.Currency, &acc.AccountNo, &openingBalanceAmount, &openingBalanceIndicator, &closingBalanceAmount, &closingBalanceIndicator); err != nil {
+		for rows.Next() {
+			var (
+				accountNo              string
+				openingBalanceCurrency string
+				countryID              string
+				openingBalanceAmount   float64
+				openingCdtDbtInd       string
+				closingBalanceAmount   float64
+				closingCdtDbtInd       string
+			)
+
+			if err := rows.Scan(&accountNo, &openingBalanceCurrency, &countryID, &openingBalanceAmount, &openingCdtDbtInd, &closingBalanceAmount, &closingCdtDbtInd); err != nil {
 				http.Error(w, "Row scan failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			if openingBalanceIndicator == "DBIT" {
-				openingBalanceAmount = -math.Abs(openingBalanceAmount)
+			// Adjust balance amounts based on credit or debit indicators
+			if openingCdtDbtInd == "DBIT" {
+				openingBalanceAmount = -openingBalanceAmount
 			}
-			if closingBalanceIndicator == "DBIT" {
-				closingBalanceAmount = -math.Abs(closingBalanceAmount)
-			}
-
-			acc.OpeningBalance = openingBalanceAmount
-			acc.ClosingBalance = closingBalanceAmount
-
-			if closingBalanceAmount != 0 {
-				acc.PercentageChange = ((closingBalanceAmount - openingBalanceAmount) / math.Abs(closingBalanceAmount)) * 100
+			if closingCdtDbtInd == "DBIT" {
+				closingBalanceAmount = -closingBalanceAmount
 			}
 
-			result = append(result, acc)
+			// Calculate percentage change
+			percentChange := ((closingBalanceAmount - openingBalanceAmount) / closingBalanceAmount) * 100
+
+			// Group by the specified key
+			groupByKey := ""
+			if req.GroupBy == "opening_balance_currency" {
+				groupByKey = openingBalanceCurrency
+			} else {
+				groupByKey = countryID
+			}
+
+			if _, exists := dataMap[groupByKey]; !exists {
+				dataMap[groupByKey] = make(map[string]float64)
+			}
+			dataMap[groupByKey][accountNo] = percentChange
 		}
 
-		if err := rows.Err(); err != nil {
-			http.Error(w, "Error iterating rows: "+err.Error(), http.StatusInternalServerError)
-			return
+		// Prepare the final result
+		var result []TreeMapData
+		for key, accounts := range dataMap {
+			var accountData []struct {
+				Key  string  `json:"key"`
+				Data float64 `json:"data"`
+			}
+
+			for accNo, percentChange := range accounts {
+				accountData = append(accountData, struct {
+					Key  string  `json:"key"`
+					Data float64 `json:"data"`
+				}{
+					Key:  accNo,
+					Data: percentChange,
+				})
+			}
+
+			result = append(result, TreeMapData{
+				Key:  key,
+				Data: accountData,
+			})
 		}
 
+		// Send the response
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		json.NewEncoder(w).Encode(result)
 	}).Methods("POST")
 
